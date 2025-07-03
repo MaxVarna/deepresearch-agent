@@ -1,58 +1,56 @@
-from typing import List
-from pydantic import BaseModel, Field, ConfigDict
+from typing import List, Dict
+from pydantic import BaseModel, Field
+from langchain.tools import tool
+from langchain_core.prompts import PromptTemplate
 
-from langchain_core.prompts import PromptTemplate, ChatPromptTemplate, SystemMessagePromptTemplate, HumanMessagePromptTemplate
-from langchain_core.runnables import Runnable
-from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_community.utilities import GoogleSearchAPIWrapper
-from langchain.agents.agent_toolkits import Tool
-from langchain.tools.render import render_text_description
-from langchain.agents.tools import tool
+# Временная заглушка для функции поиска (здесь должна быть ваша реализация)
+class SearchWrapper:
+    def run(self, query: str) -> str:
+        return f"Результат поиска по запросу: {query}"
 
-# ---- LLM и prompt ----
+search_wrapper = SearchWrapper()
 
-llm = ChatGoogleGenerativeAI(model="gemini-1.5-pro-latest", temperature=0)
+# Превращаем функцию в инструмент
+@tool
+def search_google_and_scrape(query: str) -> str:
+    """Поиск информации в интернете по заданному запросу."""
+    return search_wrapper.run(query)
 
-final_answer_prompt = ChatPromptTemplate.from_messages([
-    SystemMessagePromptTemplate.from_template(
-        template="""
-Ты — прагматичный маркетолог Макс. Твоя задача — дать исчерпывающий и структурированный ответ на вопрос пользователя,
-основываясь на предоставленном контексте и результатах веб-поиска.
-
-ИСХОДНЫЕ ДАННЫЕ ИССЛЕДОВАНИЯ:
-{research_context}
-
-РЕЗУЛЬТАТЫ ВЕБ-ПОИСКА:
-{search_results}
-
-Сформируй ответ и обязательно укажи источники.
-        """
-    ),
-    HumanMessagePromptTemplate.from_template("Вопрос: {question}"),
-])
-
-# ---- Pydantic-модель ----
-
-class FinalAnswerModel(BaseModel):
-    model_config = ConfigDict(arbitrary_types_allowed=True)
-
-    answer: str = Field(..., description="Исчерпывающий ответ на вопрос пользователя.")
-    sources: List[str] = Field(..., description="Список URL-адресов использованных источников.")
-
-# ---- Цепочка, основанная на prompt и модели ----
-
-final_answer_chain: Runnable = final_answer_prompt | llm.with_structured_output(FinalAnswerModel)
-
-# ---- Веб-поиск ----
-
-search_wrapper = GoogleSearchAPIWrapper()
-search_google_and_scrape = Tool.from_function(
-    name="google_search_and_scrape",
-    func=search_wrapper.run,
-    description="Поиск информации в интернете по заданному запросу.",
-)
-
-# ---- Инструменты ----
-
+# Инструменты
 all_tools = [search_google_and_scrape]
-tool_descriptions = render_text_description(all_tools)
+
+# Модель финального ответа
+class FinalAnswerModel(BaseModel):
+    summary: str = Field(description="Краткий ответ на вопрос пользователя.")
+    details: str = Field(description="Развернутое объяснение или аналитика.")
+    citations: List[str] = Field(description="Список использованных источников.")
+
+# Основное состояние агента
+class AgentState(BaseModel):
+    research_context: str = Field(
+        description="Полный контекст из всех предоставленных .md файлов для глубокого анализа."
+    )
+    question: str = Field(
+        description="Вопрос или задача от пользователя."
+    )
+    search_queries: List[str] = Field(
+        description="Список поисковых запросов для Google."
+    )
+    search_results: List[Dict] = Field(
+        description="Результаты веб-поиска."
+    )
+    reflection: str = Field(
+        description="Размышления агента о полноте найденной информации."
+    )
+    final_answer: FinalAnswerModel = Field(
+        description="Финальный, структурированный ответ для пользователя."
+    )
+    revision_number: int = Field(
+        description="Номер текущей итерации поиска."
+    )
+    max_revisions: int = Field(
+        description="Максимальное количество итераций."
+    )
+
+    class Config:
+        arbitrary_types_allowed = True
