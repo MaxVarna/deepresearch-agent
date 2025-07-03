@@ -1,293 +1,203 @@
 import os
+from pathlib import Path
+from typing import List
 
-from agent.tools_and_schemas import SearchQueryList, Reflection
-from dotenv import load_dotenv
-from langchain_core.messages import AIMessage
-from langgraph.types import Send
-from langgraph.graph import StateGraph
-from langgraph.graph import START, END
-from langchain_core.runnables import RunnableConfig
-from google.genai import Client
+from langchain_core.pydantic_v1 import BaseModel, Field
+from langgraph.graph import StateGraph, END
 
-from agent.state import (
-    OverallState,
-    QueryGenerationState,
-    ReflectionState,
-    WebSearchState,
-)
-from agent.configuration import Configuration
-from agent.prompts import (
-    get_current_date,
-    query_writer_instructions,
-    web_searcher_instructions,
-    reflection_instructions,
-    answer_instructions,
-)
-from langchain_google_genai import ChatGoogleGenerativeAI
-from agent.utils import (
-    get_citations,
-    get_research_topic,
-    insert_citation_markers,
-    resolve_urls,
+# --- ИЗМЕНЕНИЕ: Заменяем относительный импорт на абсолютный ---
+from agent.tools_and_schemas import (
+    FinalAnswerModel,
+    final_answer_chain,
+    all_tools,
+    search_google_and_scrape,
 )
 
-load_dotenv()
+# --- 1. Определяем состояние нашего графа (State) ---
+# Это структура данных, которая будет передаваться между узлами графа.
 
-if os.getenv("GEMINI_API_KEY") is None:
-    raise ValueError("GEMINI_API_KEY is not set")
+class AgentState(BaseModel):
+    """Определяет состояние нашего агента."""
+    # Контекст из наших файлов
+    research_context: str = Field(
+        description="Полный контекст из всех предоставленных .md файлов для глубокого анализа."
+    )
+    # Вопрос пользователя
+    question: str = Field(
+        description="Вопрос или задача от пользователя."
+    )
+    # Сгенерированные поисковые запросы
+    search_queries: List[str] = Field(
+        description="Список поисковых запросов для Google."
+    )
+    # Результаты поиска
+    search_results: List[dict] = Field(
+        description="Результаты веб-поиска."
+    )
+    # Мысли агента после анализа результатов
+    reflection: str = Field(
+        description="Размышления агента о полноте найденной информации."
+    )
+    # Финальный ответ
+    final_answer: FinalAnswerModel = Field(
+        description="Финальный, структурированный ответ для пользователя."
+    )
+    # Счетчик итераций, чтобы не уйти в бесконечный цикл
+    revision_number: int = Field(
+        description="Номер текущей итерации поиска."
+    )
+    # Максимальное количество итераций
+    max_revisions: int = Field(
+        description="Максимальное количество итераций."
+    )
 
-# Used for Google Search API
-genai_client = Client(api_key=os.getenv("GEMINI_API_KEY"))
+    class Config:
+        arbitrary_types_allowed = True
 
 
-# Nodes
-def generate_query(state: OverallState, config: RunnableConfig) -> QueryGenerationState:
-    """LangGraph node that generates search queries based on the User's question.
+# --- 2. Загрузка нашего контекста ---
+# Эта функция будет выполняться один раз при старте.
 
-    Uses Gemini 2.0 Flash to create an optimized search queries for web research based on
-    the User's question.
+def load_research_context():
+    """Загружает и объединяет все .md файлы из папки context_data."""
+    context_dir = Path(__file__).parent.parent.parent / "context_data"
+    all_texts = []
+    if not context_dir.is_dir():
+        return "Контекстные файлы не найдены."
 
-    Args:
-        state: Current graph state containing the User's question
-        config: Configuration for the runnable, including LLM provider settings
+    for md_file in context_dir.glob("*.md"):
+        try:
+            with open(md_file, "r", encoding="utf-8") as f:
+                all_texts.append(f"--- НАЧАЛО ДОКУМЕНТА: {md_file.name} ---\n\n{f.read()}\n\n--- КОНЕЦ ДОКУМЕНТА: {md_file.name} ---")
+        except Exception as e:
+            print(f"Ошибка при чтении файла {md_file}: {e}")
 
-    Returns:
-        Dictionary with state update, including search_query key containing the generated queries
+    return "\n\n".join(all_texts)
+
+# Загружаем контекст при старте приложения
+RESEARCH_CONTEXT = load_research_context()
+
+# --- 3. Определяем узлы нашего графа (Nodes) ---
+# Каждый узел - это функция, выполняющая определенное действие.
+
+def generate_queries_node(state: AgentState):
+    """Узел для генерации поисковых запросов."""
+    print("--- ГЕНЕРАЦИЯ ПОИСКОВЫХ ЗАПРОСОВ ---")
+    # Формируем промпт для модели, включая наш контекст
+    prompt = f"""Ты — прагматичный маркетолог Макс. Твоя задача — помочь мне доработать исследование.
+
+    ИСХОДНЫЕ ДАННЫЕ ДЛЯ АНАЛИЗА:
+    {state['research_context']}
+
+    ЗАДАЧА:
+    Проанализируй следующий вопрос/задачу и сформулируй 3-5 точных поисковых запросов для Google, чтобы найти внешние доказательства (статистику, исследования, мнения экспертов).
+
+    Вопрос/задача: "{state['question']}"
     """
-    configurable = Configuration.from_runnable_config(config)
+    queries = generate_search_queries.invoke({"prompt": prompt})
+    return {"search_queries": queries.queries}
 
-    # check for custom initial search query count
-    if state.get("initial_search_query_count") is None:
-        state["initial_search_query_count"] = configurable.number_of_initial_queries
-
-    # init Gemini 2.0 Flash
-    llm = ChatGoogleGenerativeAI(
-        model=configurable.query_generator_model,
-        temperature=1.0,
-        max_retries=2,
-        api_key=os.getenv("GEMINI_API_KEY"),
+def research_node(state: AgentState):
+    """Узел для выполнения веб-поиска."""
+    print("--- ПОИСК В ИНТЕРНЕТЕ ---")
+    results = search_google_and_scrape.invoke(
+        {"queries": state["search_queries"]}
     )
-    structured_llm = llm.with_structured_output(SearchQueryList)
+    return {"search_results": results}
 
-    # Format the prompt
-    current_date = get_current_date()
-    formatted_prompt = query_writer_instructions.format(
-        current_date=current_date,
-        research_topic=get_research_topic(state["messages"]),
-        number_queries=state["initial_search_query_count"],
+def reflection_node(state: AgentState):
+    """Узел для анализа результатов и принятия решения."""
+    print("--- АНАЛИЗ РЕЗУЛЬТАТОВ ---")
+    reflection = reflect_on_results.invoke(
+        {
+            "question": state["question"],
+            "search_results": state["search_results"],
+            "research_context": state["research_context"]
+        }
     )
-    # Generate the search queries
-    result = structured_llm.invoke(formatted_prompt)
-    return {"search_query": result.query}
+    return {"reflection": reflection.reflection}
 
-
-def continue_to_web_research(state: QueryGenerationState):
-    """LangGraph node that sends the search queries to the web research node.
-
-    This is used to spawn n number of web research nodes, one for each search query.
-    """
-    return [
-        Send("web_research", {"search_query": search_query, "id": int(idx)})
-        for idx, search_query in enumerate(state["search_query"])
-    ]
-
-
-def web_research(state: WebSearchState, config: RunnableConfig) -> OverallState:
-    """LangGraph node that performs web research using the native Google Search API tool.
-
-    Executes a web search using the native Google Search API tool in combination with Gemini 2.0 Flash.
-
-    Args:
-        state: Current graph state containing the search query and research loop count
-        config: Configuration for the runnable, including search API settings
-
-    Returns:
-        Dictionary with state update, including sources_gathered, research_loop_count, and web_research_results
-    """
-    # Configure
-    configurable = Configuration.from_runnable_config(config)
-    formatted_prompt = web_searcher_instructions.format(
-        current_date=get_current_date(),
-        research_topic=state["search_query"],
+def final_answer_node(state: AgentState):
+    """Узел для генерации финального ответа."""
+    print("--- ГЕНЕРАЦИЯ ФИНАЛЬНОГО ОТВЕТА ---")
+    final_answer = final_answer_chain.invoke(
+        {
+            "question": state.question,
+            "search_results": state.search_results,
+            "research_context": state.research_context,
+        }
     )
-
-    # Uses the google genai client as the langchain client doesn't return grounding metadata
-    response = genai_client.models.generate_content(
-        model=configurable.query_generator_model,
-        contents=formatted_prompt,
-        config={
-            "tools": [{"google_search": {}}],
-            "temperature": 0,
-        },
-    )
-    # resolve the urls to short urls for saving tokens and time
-    resolved_urls = resolve_urls(
-        response.candidates[0].grounding_metadata.grounding_chunks, state["id"]
-    )
-    # Gets the citations and adds them to the generated text
-    citations = get_citations(response, resolved_urls)
-    modified_text = insert_citation_markers(response.text, citations)
-    sources_gathered = [item for citation in citations for item in citation["segments"]]
-
-    return {
-        "sources_gathered": sources_gathered,
-        "search_query": [state["search_query"]],
-        "web_research_result": [modified_text],
-    }
+    return {"final_answer": final_answer}
 
 
-def reflection(state: OverallState, config: RunnableConfig) -> ReflectionState:
-    """LangGraph node that identifies knowledge gaps and generates potential follow-up queries.
+# --- 4. Определяем логику переходов между узлами (Edges) ---
 
-    Analyzes the current summary to identify areas for further research and generates
-    potential follow-up queries. Uses structured output to extract
-    the follow-up query in JSON format.
-
-    Args:
-        state: Current graph state containing the running summary and research topic
-        config: Configuration for the runnable, including LLM provider settings
-
-    Returns:
-        Dictionary with state update, including search_query key containing the generated follow-up query
-    """
-    configurable = Configuration.from_runnable_config(config)
-    # Increment the research loop count and get the reasoning model
-    state["research_loop_count"] = state.get("research_loop_count", 0) + 1
-    reasoning_model = state.get("reasoning_model", configurable.reflection_model)
-
-    # Format the prompt
-    current_date = get_current_date()
-    formatted_prompt = reflection_instructions.format(
-        current_date=current_date,
-        research_topic=get_research_topic(state["messages"]),
-        summaries="\n\n---\n\n".join(state["web_research_result"]),
-    )
-    # init Reasoning Model
-    llm = ChatGoogleGenerativeAI(
-        model=reasoning_model,
-        temperature=1.0,
-        max_retries=2,
-        api_key=os.getenv("GEMINI_API_KEY"),
-    )
-    result = llm.with_structured_output(Reflection).invoke(formatted_prompt)
-
-    return {
-        "is_sufficient": result.is_sufficient,
-        "knowledge_gap": result.knowledge_gap,
-        "follow_up_queries": result.follow_up_queries,
-        "research_loop_count": state["research_loop_count"],
-        "number_of_ran_queries": len(state["search_query"]),
-    }
-
-
-def evaluate_research(
-    state: ReflectionState,
-    config: RunnableConfig,
-) -> OverallState:
-    """LangGraph routing function that determines the next step in the research flow.
-
-    Controls the research loop by deciding whether to continue gathering information
-    or to finalize the summary based on the configured maximum number of research loops.
-
-    Args:
-        state: Current graph state containing the research loop count
-        config: Configuration for the runnable, including max_research_loops setting
-
-    Returns:
-        String literal indicating the next node to visit ("web_research" or "finalize_summary")
-    """
-    configurable = Configuration.from_runnable_config(config)
-    max_research_loops = (
-        state.get("max_research_loops")
-        if state.get("max_research_loops") is not None
-        else configurable.max_research_loops
-    )
-    if state["is_sufficient"] or state["research_loop_count"] >= max_research_loops:
-        return "finalize_answer"
+def should_continue(state: AgentState):
+    """Функция, определяющая, нужно ли продолжать поиск или можно генерировать ответ."""
+    if state["revision_number"] > state["max_revisions"]:
+        return "end"
+    if "нет" in state["reflection"].lower() or "достаточно" in state["reflection"].lower():
+        return "end"
     else:
-        return [
-            Send(
-                "web_research",
-                {
-                    "search_query": follow_up_query,
-                    "id": state["number_of_ran_queries"] + int(idx),
-                },
-            )
-            for idx, follow_up_query in enumerate(state["follow_up_queries"])
-        ]
+        return "continue"
 
+# --- 5. Собираем граф ---
 
-def finalize_answer(state: OverallState, config: RunnableConfig):
-    """LangGraph node that finalizes the research summary.
+# Создаем экземпляр графа
+builder = StateGraph(AgentState)
 
-    Prepares the final output by deduplicating and formatting sources, then
-    combining them with the running summary to create a well-structured
-    research report with proper citations.
+# Добавляем узлы
+builder.add_node("generate_queries", generate_queries_node)
+builder.add_node("research", research_node)
+builder.add_node("reflect", reflection_node)
+builder.add_node("final_answer", final_answer_node)
 
-    Args:
-        state: Current graph state containing the running summary and sources gathered
+# Определяем точку входа
+builder.set_entry_point("generate_queries")
 
-    Returns:
-        Dictionary with state update, including running_summary key containing the formatted final summary with sources
-    """
-    configurable = Configuration.from_runnable_config(config)
-    reasoning_model = state.get("reasoning_model") or configurable.answer_model
-
-    # Format the prompt
-    current_date = get_current_date()
-    formatted_prompt = answer_instructions.format(
-        current_date=current_date,
-        research_topic=get_research_topic(state["messages"]),
-        summaries="\n---\n\n".join(state["web_research_result"]),
-    )
-
-    # init Reasoning Model, default to Gemini 2.5 Flash
-    llm = ChatGoogleGenerativeAI(
-        model=reasoning_model,
-        temperature=0,
-        max_retries=2,
-        api_key=os.getenv("GEMINI_API_KEY"),
-    )
-    result = llm.invoke(formatted_prompt)
-
-    # Replace the short urls with the original urls and add all used urls to the sources_gathered
-    unique_sources = []
-    for source in state["sources_gathered"]:
-        if source["short_url"] in result.content:
-            result.content = result.content.replace(
-                source["short_url"], source["value"]
-            )
-            unique_sources.append(source)
-
-    return {
-        "messages": [AIMessage(content=result.content)],
-        "sources_gathered": unique_sources,
-    }
-
-
-# Create our Agent Graph
-builder = StateGraph(OverallState, config_schema=Configuration)
-
-# Define the nodes we will cycle between
-builder.add_node("generate_query", generate_query)
-builder.add_node("web_research", web_research)
-builder.add_node("reflection", reflection)
-builder.add_node("finalize_answer", finalize_answer)
-
-# Set the entrypoint as `generate_query`
-# This means that this node is the first one called
-builder.add_edge(START, "generate_query")
-# Add conditional edge to continue with search queries in a parallel branch
+# Добавляем связи между узлами
+builder.add_edge("generate_queries", "research")
+builder.add_edge("research", "reflect")
 builder.add_conditional_edges(
-    "generate_query", continue_to_web_research, ["web_research"]
+    "reflect",
+    should_continue,
+    {
+        "continue": "generate_queries",  # Если нужно, возвращаемся к генерации запросов
+        "end": "final_answer",      # Если информации достаточно, генерируем ответ
+    },
 )
-# Reflect on the web research
-builder.add_edge("web_research", "reflection")
-# Evaluate the research
-builder.add_conditional_edges(
-    "reflection", evaluate_research, ["web_research", "finalize_answer"]
-)
-# Finalize the answer
-builder.add_edge("finalize_answer", END)
+builder.add_edge("final_answer", END)
 
-graph = builder.compile(name="pro-search-agent")
+# Компилируем граф в исполняемый объект
+graph = builder.compile()
+
+
+# --- 6. Функция для запуска графа с начальными данными ---
+
+def run_agent(question: str):
+    """Запускает агент с вопросом пользователя."""
+    return graph.invoke({
+        "question": question,
+        "research_context": RESEARCH_CONTEXT,
+        "revision_number": 0,
+        "max_revisions": 3,
+    })
+
+# Добавляем наш граф в приложение LangServe
+from langserve import add_routes
+from fastapi import FastAPI
+
+app = FastAPI(
+  title="DeepResearch Agent Server",
+  version="1.0",
+  description="Сервер для аналитического агента Макса",
+)
+
+# Добавляем эндпоинт для нашего агента
+add_routes(
+    app,
+    run_agent,
+    path="/deepresearch",
+    input_type=str,
+    output_type=dict,
+)
